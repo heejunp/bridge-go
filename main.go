@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
