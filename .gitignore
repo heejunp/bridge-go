@@ -12,9 +12,6 @@ bridge-go
 # Dependency directories
 vendor/
 
-# Go module artifacts
-go.sum
-
 # Local environment & IDE
 .env
 .idea/
