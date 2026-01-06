@@ -2,23 +2,36 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
-
+	"os"
+	"path/filepath"
+	"fmt"
 	"time"
 
-	pb "bridge-go/proto"
-
 	"github.com/gorilla/websocket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+
+	// Kubernetes Client
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 )
 
 var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	grpcClient pb.PodServiceClient
+	k8sClient  *kubernetes.Clientset
+	
+	// Connections pool to broadcast events to all connected WS clients
+	wsClients   = make(map[*websocket.Conn]bool)
+	broadcast   = make(chan BridgeMessage)
 )
 
 // Message format for Frontend
@@ -37,20 +50,125 @@ type IncomingMessage struct {
 }
 
 func main() {
-	// 1. Connect to gRPC Server
-	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	defer conn.Close()
-	grpcClient = pb.NewPodServiceClient(conn)
+	// 1. Initialize Kubernetes Client (Informer)
+	initKubernetesClient()
 
-	// 2. Start WebSocket Server
+	// 2. Start Broadcaster
+	go handleMessages()
+
+	// 3. Probes
+	http.HandleFunc("/liveness", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	http.HandleFunc("/readiness", func(w http.ResponseWriter, r *http.Request) {
+		if k8sClient != nil {
+			w.Write([]byte("ok"))
+		} else {
+			w.WriteHeader(500)
+		}
+	})
+	http.HandleFunc("/startup", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	// 4. Start WebSocket Server
 	http.HandleFunc("/ws", handleWebSocket)
 	
 	log.Println("Bridge Server listening on :9090")
 	if err := http.ListenAndServe(":9090", nil); err != nil {
 		log.Fatal("ListenAndServe:", err)
+	}
+}
+
+func initKubernetesClient() {
+	var config *rest.Config
+	var err error
+
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		config, err = rest.InClusterConfig()
+	} else {
+		var kubeconfig *string
+		if home := homedir.HomeDir(); home != "" {
+			kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+		} else {
+			kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+		}
+		flag.Parse()
+		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	}
+
+	if err != nil {
+		log.Printf("Error creating K8s config: %v", err)
+		return
+	}
+
+	k8sClient, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Printf("Error creating K8s client: %v", err)
+		return
+	}
+	
+	log.Println("Connected to Kubernetes Cluster (Bridge)")
+
+	// Start Informer
+	factory := informers.NewSharedInformerFactory(k8sClient, time.Minute*10)
+	podInformer := factory.Core().V1().Pods().Informer()
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod := obj.(*corev1.Pod)
+			handleK8sEvent("ADDED", pod)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			pod := newObj.(*corev1.Pod)
+			handleK8sEvent("MODIFIED", pod)
+		},
+		DeleteFunc: func(obj interface{}) {
+			pod := obj.(*corev1.Pod)
+			handleK8sEvent("DELETED", pod)
+		},
+	})
+	
+	stopCh := make(chan struct{})
+	factory.Start(stopCh)
+}
+
+func handleK8sEvent(eventType string, k8sPod *corev1.Pod) {
+	if k8sPod.Namespace != "default" {
+		return 
+	}
+
+	// Simple Sim: Map Name hash to Position
+	hash := 0
+	for _, c := range k8sPod.Name {
+		hash += int(c)
+	}
+	x := float64(hash%10 - 5)
+	z := float64((hash/10)%10 - 5)
+
+	msg := BridgeMessage{
+		Type:     eventType,
+		ID:       string(k8sPod.UID),
+		Name:     k8sPod.Name,
+		Status:   string(k8sPod.Status.Phase),
+		HP:       5,
+		Position: []float64{x, 0, z},
+	}
+	
+	broadcast <- msg
+}
+
+func handleMessages() {
+	for {
+		msg := <-broadcast
+		for client := range wsClients {
+			err := client.WriteJSON(msg)
+			if err != nil {
+				log.Printf("Websocket error: %v", err)
+				client.Close()
+				delete(wsClients, client)
+			}
+		}
 	}
 }
 
@@ -60,67 +178,66 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Println("upgrade:", err)
 		return
 	}
-	defer ws.Close()
 
+	wsClients[ws] = true
 	log.Println("New Client Connected")
 
-	// Channel to signal stop
-	done := make(chan struct{})
-
-	// Goroutine: Read from WS (Frontend -> Bridge -> API)
-	go func() {
-		defer close(done)
-		for {
-			var msg IncomingMessage
-			err := ws.ReadJSON(&msg)
-			if err != nil {
-				return
-			}
-			
-			if msg.Action == "kill" {
-				log.Printf("Kill request for Pod ID: %s", msg.PodID)
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				_, err := grpcClient.DeletePod(ctx, &pb.PodId{Id: msg.PodID})
-				cancel()
-				if err != nil {
-					log.Printf("Failed to delete pod: %v", err)
-				}
-			}
+	for {
+		var msg IncomingMessage
+		err := ws.ReadJSON(&msg)
+		if err != nil {
+			delete(wsClients, ws)
+			break
 		}
-	}()
+		
+		if msg.Action == "kill" && msg.PodID != "" {
+			log.Printf("Kill request for UID: %s", msg.PodID)
+			go deletePod(msg.PodID)
+		} else if msg.Action == "create" {
+			log.Println("Create request")
+			go createPod()
+		}
+	}
+}
 
-	// Subscribe to gRPC Stream (API -> Bridge -> Frontend)
-	stream, err := grpcClient.Subscribe(context.Background(), &pb.Empty{})
+func deletePod(uid string) {
+	pods, err := k8sClient.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		log.Printf("Error subscribing to gRPC: %v", err)
+		log.Println("Failed to list pods:", err)
 		return
 	}
-
-	for {
-		select {
-		case <-done:
-			return
-		default:
-			evt, err := stream.Recv()
-			if err != nil {
-				log.Printf("Stream closed: %v", err)
-				return
-			}
-			
-			// Convert Proto to JSON
-			msg := BridgeMessage{
-				Type:     evt.Type,
-				ID:       evt.Id,
-				Name:     evt.Name,
-				Status:   evt.Status,
-				HP:       int(evt.Hp),
-				Position: evt.Position,
-			}
-			
-			if err := ws.WriteJSON(msg); err != nil {
-				log.Println("write:", err)
-				return
-			}
+	
+	var podName string
+	for _, p := range pods.Items {
+		if string(p.UID) == uid {
+			podName = p.Name
+			break
 		}
+	}
+	
+	if podName != "" {
+		k8sClient.CoreV1().Pods("default").Delete(context.TODO(), podName, metav1.DeleteOptions{})
+		log.Printf("Deleted Pod: %s", podName)
+	} else {
+		log.Printf("Pod with UID %s not found", uid)
+	}
+}
+
+func createPod() {
+	podName := "nginx-" + time.Now().Format("150405")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName,
+			Labels: map[string]string{ "app": "demo" },
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{ Name: "nginx", Image: "nginx:alpine" },
+			},
+		},
+	}
+	_, err := k8sClient.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
+	if err != nil {
+		log.Println("Failed to create pod:", err)
 	}
 }
