@@ -178,6 +178,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send Initial State
+	if k8sClient != nil {
+		go syncInitialPods(ws)
+	}
+
 	wsClients[ws] = true
 	log.Println("New Client Connected")
 
@@ -238,5 +243,36 @@ func createPod() {
 	_, err := k8sClient.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 	if err != nil {
 		log.Println("Failed to create pod:", err)
+	}
+}
+
+func syncInitialPods(ws *websocket.Conn) {
+	pods, err := k8sClient.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		log.Println("Initial sync failed:", err)
+		return
+	}
+
+	for _, p := range pods.Items {
+		// Calculate Position (Same logic as Event Handler)
+		hash := 0
+		for _, c := range p.Name {
+			hash += int(c)
+		}
+		x := float64(hash%10 - 5)
+		z := float64((hash/10)%10 - 5)
+
+		msg := BridgeMessage{
+			Type:     "ADDED",
+			ID:       string(p.UID),
+			Name:     p.Name,
+			Status:   string(p.Status.Phase),
+			HP:       5,
+			Position: []float64{x, 0, z},
+		}
+		if err := ws.WriteJSON(msg); err != nil {
+			log.Println("Initial sync write error:", err)
+			return
+		}
 	}
 }
