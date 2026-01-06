@@ -1,0 +1,26 @@
+# Binary executable files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+myapp
+bridge-go
+/web-go/myapp
+/bridge-go/bridge-go
+
+# Dependency directories
+vendor/
+
+# Go module artifacts
+go.sum
+
+# Local environment & IDE
+.env
+.idea/
+.vscode/
+*.swp
+
+# Docker / Kubernetes Temporary files
+deploy.yaml
+*.log
